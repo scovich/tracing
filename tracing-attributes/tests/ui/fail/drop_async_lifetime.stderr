@@ -1,0 +1,13 @@
+error[E0700]: hidden type for `impl Future<Output = usize>` captures lifetime that does not appear in bounds
+ --> tests/ui/fail/drop_async_lifetime.rs:4:1
+  |
+4 | #[tracing::instrument(drop)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ opaque type defined here
+5 | async fn my_function(arg: &str) -> usize {
+  |                           ---- hidden type `Instrumented<{async block@$DIR/tests/ui/fail/drop_async_lifetime.rs:4:1: 4:29}>` captures the anonymous lifetime defined here
+  |
+  = note: this error originates in the attribute macro `tracing::instrument` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: add a `use<...>` bound to explicitly capture `'_`
+  |
+4 | #[tracing::instrument(drop)] + use<'_>
+  |                              +++++++++

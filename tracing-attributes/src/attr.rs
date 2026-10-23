@@ -15,6 +15,14 @@ pub(crate) struct EventArgs {
     pub(crate) mode: FormatMode,
 }
 
+/// Arguments to `#[instrument(drop(...))]`.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct DropArgs {
+    level: Option<Level>,
+    /// Keep `async fn` and emit only after a poll.
+    pub(crate) after_first_poll: bool,
+}
+
 #[derive(Clone, Default, Debug)]
 pub(crate) struct InstrumentArgs {
     level: Option<Level>,
@@ -27,6 +35,7 @@ pub(crate) struct InstrumentArgs {
     pub(crate) fields: Option<Fields>,
     pub(crate) err_args: Option<EventArgs>,
     pub(crate) ret_args: Option<EventArgs>,
+    pub(crate) drop_args: Option<DropArgs>,
     /// Errors describing any unrecognized parse inputs that we skipped.
     parse_warnings: Vec<syn::Error>,
 }
@@ -34,6 +43,14 @@ pub(crate) struct InstrumentArgs {
 impl InstrumentArgs {
     pub(crate) fn level(&self) -> Level {
         self.level.clone().unwrap_or(Level::Info)
+    }
+
+    /// `drop` without `after_first_poll` rewrites `async fn` so an unpolled
+    /// future still emits. `drop(after_first_poll)` keeps `async fn`.
+    pub(crate) fn drop_hoists_future(&self) -> bool {
+        self.drop_args
+            .as_ref()
+            .is_some_and(|args| !args.after_first_poll)
     }
 
     pub(crate) fn target(&self) -> impl ToTokens {
@@ -148,6 +165,12 @@ impl Parse for InstrumentArgs {
                 let _ = input.parse::<kw::ret>()?;
                 let ret_args = EventArgs::parse(input)?;
                 args.ret_args = Some(ret_args);
+            } else if lookahead.peek(kw::drop) {
+                if args.drop_args.is_some() {
+                    return Err(input.error("expected only a single `drop` argument"));
+                }
+                let _ = input.parse::<kw::drop>()?;
+                args.drop_args = Some(DropArgs::parse(input)?);
             } else if lookahead.peek(Token![,]) {
                 let _ = input.parse::<Token![,]>()?;
             } else {
@@ -166,6 +189,12 @@ impl Parse for InstrumentArgs {
 }
 
 impl EventArgs {
+    pub(crate) fn level(&self, default: Level) -> Level {
+        self.level.clone().unwrap_or(default)
+    }
+}
+
+impl DropArgs {
     pub(crate) fn level(&self, default: Level) -> Level {
         self.level.clone().unwrap_or(default)
     }
@@ -201,6 +230,45 @@ impl Parse for EventArgs {
                 }
                 Ok(())
             };
+        parse_one_arg()?;
+        if !content.is_empty() {
+            if content.lookahead1().peek(Token![,]) {
+                let _ = content.parse::<Token![,]>()?;
+                parse_one_arg()?;
+            } else {
+                return Err(content.error("expected `,` or `)`"));
+            }
+        }
+        Ok(result)
+    }
+}
+
+impl Parse for DropArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        if !input.peek(syn::token::Paren) {
+            return Ok(Self::default());
+        }
+        let content;
+        let _ = syn::parenthesized!(content in input);
+        let mut result = Self::default();
+        let mut parse_one_arg = || {
+            let lookahead = content.lookahead1();
+            if lookahead.peek(kw::level) {
+                if result.level.is_some() {
+                    return Err(content.error("expected only a single `level` argument"));
+                }
+                result.level = Some(content.parse()?);
+            } else if lookahead.peek(kw::after_first_poll) {
+                if result.after_first_poll {
+                    return Err(content.error("expected only a single `after_first_poll` argument"));
+                }
+                let _ = content.parse::<kw::after_first_poll>()?;
+                result.after_first_poll = true;
+            } else {
+                return Err(lookahead.error());
+            }
+            Ok(())
+        };
         parse_one_arg()?;
         if !content.is_empty() {
             if content.lookahead1().peek(Token![,]) {
@@ -504,4 +572,6 @@ mod kw {
     syn::custom_keyword!(name);
     syn::custom_keyword!(err);
     syn::custom_keyword!(ret);
+    syn::custom_keyword!(drop);
+    syn::custom_keyword!(after_first_poll);
 }

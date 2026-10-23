@@ -55,6 +55,7 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
     } = sig;
 
     let warnings = args.warnings();
+    let hoist_drop = asyncness.is_some() && args.drop_hoists_future();
 
     let (return_type, return_span) = if let ReturnType::Type(_, return_type) = &output {
         (erase_impl_trait(return_type), return_type.span())
@@ -95,10 +96,35 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
         &block,
         params,
         asyncness.is_some(),
+        // When `drop` is set, emit the instrumented future as the function's
+        // return value instead of awaiting it inside an `async fn`. That makes
+        // the drop guard a capture of the returned future, so dropping an
+        // unpolled future still runs it.
+        !hoist_drop,
         args,
         instrumented_function_name,
         self_type,
     );
+
+    // Strip `async` and rewrite the return type so the drop guard is a
+    // capture of the returned future, not of the `async fn` body. Restore
+    // `#[must_use]` because `async fn` would have implied it.
+    let mut outer_attrs = outer_attrs.clone();
+    if hoist_drop {
+        outer_attrs.push(syn::parse_quote!(
+            #[must_use = "futures do nothing unless you `.await` or poll them"]
+        ));
+    }
+    let asyncness = if hoist_drop { None } else { asyncness };
+    let output = if hoist_drop {
+        let output_ty = match &output {
+            ReturnType::Default => quote!(()),
+            ReturnType::Type(_, ty) => quote!(#ty),
+        };
+        quote!(-> impl ::core::future::Future<Output = #output_ty>)
+    } else {
+        quote!(#output)
+    };
 
     let mut result = quote!(
         #(#outer_attrs) *
@@ -123,11 +149,47 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
     result
 }
 
+/// Pending-drop guard: `(outer bind, async-block prologue, disarm)`.
+///
+/// Hoisted drop constructs the guard outside the returned future so an
+/// unpolled future still emits. `after_first_poll` constructs it inside,
+/// so the first poll is what arms it.
+fn drop_guard_tokens(
+    drop_event: Option<&TokenStream>,
+    hoist: bool,
+) -> (TokenStream, TokenStream, TokenStream) {
+    let drop_event = match drop_event {
+        Some(drop_event) => drop_event,
+        None => return (quote!(), quote!(), quote!()),
+    };
+    let drop_guard = quote!({
+        struct __TracingAttrDropGuard;
+        impl ::core::ops::Drop for __TracingAttrDropGuard {
+            fn drop(&mut self) {
+                if !::std::thread::panicking() {
+                    #drop_event;
+                }
+            }
+        }
+        __TracingAttrDropGuard
+    });
+    let bind = quote!(let __tracing_attr_drop_guard = #drop_guard;);
+    let disarm = quote!(
+        let _ = ::core::mem::ManuallyDrop::new(__tracing_attr_drop_guard);
+    );
+    if hoist {
+        (bind, quote!(), disarm)
+    } else {
+        (quote!(), bind, disarm)
+    }
+}
+
 /// Instrument a block
 fn gen_block<B: ToTokens>(
     block: &B,
     params: &Punctuated<FnArg, Token![,]>,
     async_context: bool,
+    await_output: bool,
     mut args: InstrumentArgs,
     instrumented_function_name: &str,
     self_type: Option<&TypePath>,
@@ -142,6 +204,7 @@ fn gen_block<B: ToTokens>(
 
     let args_level = args.level();
     let level = args_level.clone();
+    let drop_hoists_future = args.drop_hoists_future();
 
     let follows_from = args.follows_from.iter();
     let follows_from = quote! {
@@ -282,7 +345,7 @@ fn gen_block<B: ToTokens>(
 
     let ret_event = match args.ret_args {
         Some(event_args) => {
-            let level_tokens = event_args.level(args_level);
+            let level_tokens = event_args.level(args_level.clone());
             match event_args.mode {
                 FormatMode::Display => Some(quote!(
                     ::tracing::event!(target: #target, #level_tokens, return = %x)
@@ -295,6 +358,16 @@ fn gen_block<B: ToTokens>(
         _ => None,
     };
 
+    let drop_event = match args.drop_args {
+        Some(event_args) => {
+            let level_tokens = event_args.level(args_level);
+            Some(quote!(
+                ::tracing::event!(target: #target, #level_tokens, dropped = true)
+            ))
+        }
+        None => None,
+    };
+
     // Generate the instrumented function body.
     // If the function is an `async fn`, this will wrap it in an async block,
     // which is `instrument`ed using `tracing-futures`. Otherwise, this will
@@ -303,11 +376,15 @@ fn gen_block<B: ToTokens>(
     // If `ret` is in args, instrument any resulting `Ok`s when the function
     // returns `Result`s, otherwise instrument any resulting values.
     if async_context {
+        let (drop_guard_outer, drop_guard_prologue, drop_guard_disarm) =
+            drop_guard_tokens(drop_event.as_ref(), drop_hoists_future);
+
         let mk_fut = match (err_event, ret_event) {
             (Some(err_event), Some(ret_event)) => quote_spanned!(block.span()=>
                 async move {
+                    #drop_guard_prologue
                     let __match_scrutinee = async move #block.await;
-                    match  __match_scrutinee {
+                    let __tracing_attr_output = match  __match_scrutinee {
                         #[allow(clippy::unit_arg)]
                         Ok(x) => {
                             #ret_event;
@@ -317,26 +394,44 @@ fn gen_block<B: ToTokens>(
                             #err_event;
                             Err(e)
                         }
-                    }
+                    };
+                    #drop_guard_disarm
+                    __tracing_attr_output
                 }
             ),
             (Some(err_event), None) => quote_spanned!(block.span()=>
                 async move {
-                    match async move #block.await {
+                    #drop_guard_prologue
+                    let __tracing_attr_output = match async move #block.await {
                         #[allow(clippy::unit_arg)]
                         Ok(x) => Ok(x),
                         Err(e) => {
                             #err_event;
                             Err(e)
                         }
-                    }
+                    };
+                    #drop_guard_disarm
+                    __tracing_attr_output
                 }
             ),
             (None, Some(ret_event)) => quote_spanned!(block.span()=>
                 async move {
+                    #drop_guard_prologue
                     let x = async move #block.await;
                     #ret_event;
+                    #drop_guard_disarm
                     x
+                }
+            ),
+            (None, None) if drop_event.is_some() => quote_spanned!(block.span()=>
+                async move {
+                    #drop_guard_prologue
+                    // This inner async block turns `return` in the source
+                    // body into an output we can observe before disarming
+                    // the pending-drop guard.
+                    let __tracing_attr_output = async move #block.await;
+                    #drop_guard_disarm
+                    __tracing_attr_output
                 }
             ),
             (None, None) => quote_spanned!(block.span()=>
@@ -344,21 +439,43 @@ fn gen_block<B: ToTokens>(
             ),
         };
 
-        return quote!(
+        if await_output {
+            return quote!(
+                let __tracing_attr_span = #span;
+                #drop_guard_outer
+                let __tracing_instrument_future = #mk_fut;
+                #[allow(clippy::implicit_return)]
+                if !__tracing_attr_span.is_disabled() {
+                    #follows_from
+                    ::tracing::Instrument::instrument(
+                        __tracing_instrument_future,
+                        __tracing_attr_span
+                    )
+                    .await
+                } else {
+                    __tracing_instrument_future.await
+                }
+            );
+        }
+
+        return quote!({
             let __tracing_attr_span = #span;
+            #drop_guard_outer
             let __tracing_instrument_future = #mk_fut;
-            #[allow(clippy::implicit_return)]
             if !__tracing_attr_span.is_disabled() {
                 #follows_from
-                ::tracing::Instrument::instrument(
-                    __tracing_instrument_future,
-                    __tracing_attr_span
-                )
-                .await
-            } else {
-                __tracing_instrument_future.await
             }
-        );
+            ::tracing::Instrument::instrument(
+                __tracing_instrument_future,
+                __tracing_attr_span
+            )
+        });
+    }
+
+    if drop_event.is_some() {
+        return quote! {
+            compile_error!("the `drop` argument requires an `async fn`")
+        };
     }
 
     let span = quote!(
@@ -709,6 +826,7 @@ impl<'block> AsyncInfo<'block> {
         args: InstrumentArgs,
         instrumented_function_name: &str,
     ) -> Result<proc_macro::TokenStream, syn::Error> {
+        let hoist_drop = args.drop_hoists_future();
         // let's rewrite some statements!
         let mut out_stmts: Vec<TokenStream> = self
             .input
@@ -747,12 +865,23 @@ impl<'block> AsyncInfo<'block> {
                         &async_expr.block,
                         &self.input.sig.inputs,
                         true,
+                        !hoist_drop,
                         args,
                         instrumented_function_name,
                         None,
                     );
                     let async_attrs = &async_expr.attrs;
-                    if pinned_box {
+                    if hoist_drop {
+                        if pinned_box {
+                            quote! {
+                                ::std::boxed::Box::pin(#(#async_attrs) * #instrumented_block)
+                            }
+                        } else {
+                            quote! {
+                                #(#async_attrs) * #instrumented_block
+                            }
+                        }
+                    } else if pinned_box {
                         quote! {
                             ::std::boxed::Box::pin(#(#async_attrs) * async move { #instrumented_block })
                         }

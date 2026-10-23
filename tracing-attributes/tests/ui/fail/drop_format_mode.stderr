@@ -1,0 +1,11 @@
+error: expected `level` or `after_first_poll`
+ --> tests/ui/fail/drop_format_mode.rs:1:28
+  |
+1 | #[tracing::instrument(drop(Debug))]
+  |                            ^^^^^
+
+error: expected `level` or `after_first_poll`
+ --> tests/ui/fail/drop_format_mode.rs:4:28
+  |
+4 | #[tracing::instrument(drop(Display))]
+  |                            ^^^^^^^

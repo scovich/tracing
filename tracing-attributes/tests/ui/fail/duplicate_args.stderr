@@ -9,3 +9,9 @@ error: expected only a single `follows_from` argument
   |
 4 | #[tracing::instrument(follows_from = [tracing::Span::none()], follows_from = [tracing::Span::none()])]
   |                                                               ^^^^^^^^^^^^
+
+error: expected only a single `drop` argument
+ --> tests/ui/fail/duplicate_args.rs:7:29
+  |
+7 | #[tracing::instrument(drop, drop)]
+  |                             ^^^^

@@ -1,0 +1,15 @@
+error: the `drop` argument requires an `async fn`
+ --> tests/ui/fail/drop_on_sync.rs:1:1
+  |
+1 | #[tracing::instrument(drop)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `tracing::instrument` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: the `drop` argument requires an `async fn`
+ --> tests/ui/fail/drop_on_sync.rs:4:1
+  |
+4 | #[tracing::instrument(drop)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `tracing::instrument` (in Nightly builds, run with -Z macro-backtrace for more info)

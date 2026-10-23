@@ -514,6 +514,85 @@ mod expand;
 /// }
 /// ```
 ///
+/// Adding the `drop` argument to `#[instrument]` on an `async fn` emits one
+/// event if the generated future is dropped before it completes, including if
+/// it is never polled. Completing normally, or unwinding due to a panic, does
+/// not emit the event. The event uses the span's level and target unless
+/// overridden, and records a `dropped` field:
+///
+/// ```
+/// # use tracing_attributes::instrument;
+/// #[instrument(drop)]
+/// async fn my_function() {
+///     // ...
+/// }
+///
+/// # use tracing::Level;
+/// #[instrument(drop(level = Level::DEBUG))]
+/// async fn my_function_debug() {
+///     // ...
+/// }
+/// ```
+///
+/// `drop` requires an `async fn`, including the async-trait-style functions
+/// described below. A future that is leaked (for example with
+/// [`std::mem::forget`]) or a process abort cannot emit the event.
+///
+/// To cover an unpolled future, `drop` rewrites `async fn f() -> T` into
+/// `fn f() -> impl Future<Output = T>`. That opaque type captures borrowed
+/// argument lifetimes only in Edition 2024 (and in trait impl methods, which
+/// use different capture rules in every edition). On Edition 2021 and earlier,
+/// a free function or inherent method with a borrowed argument fails with
+/// [`E0700`]:
+///
+/// ```compile_fail,E0700
+/// # use tracing_attributes::instrument;
+/// #[instrument(drop)]
+/// async fn my_function(arg: &str) {
+///     let _ = arg.len();
+/// }
+/// ```
+///
+/// Owned arguments compile under that rewrite on every edition:
+///
+/// ```
+/// # use tracing_attributes::instrument;
+/// #[instrument(drop)]
+/// async fn my_function(arg: String) {
+///     let _ = arg.len();
+/// }
+/// ```
+///
+/// Trait impl methods also compile, even with borrowed `self`:
+///
+/// ```
+/// # #![allow(async_fn_in_trait)]
+/// # use tracing_attributes::instrument;
+/// #[derive(Debug)]
+/// struct FooImpl;
+/// trait Foo {
+///     async fn foo(&self);
+/// }
+/// impl Foo for FooImpl {
+///     #[instrument(drop)]
+///     async fn foo(&self) {}
+/// }
+/// ```
+///
+/// `drop(after_first_poll)` keeps `async fn` and skips the rewrite. Borrowed
+/// arguments then compile on every edition, but a future dropped before its
+/// first poll does not emit:
+///
+/// ```
+/// # use tracing_attributes::instrument;
+/// #[instrument(drop(after_first_poll))]
+/// async fn my_function(arg: &str) {
+///     let _ = arg.len();
+/// }
+/// ```
+///
+/// [`E0700`]: https://doc.rust-lang.org/error_codes/E0700.html
+///
 /// `async fn`s may also be instrumented:
 ///
 /// ```
